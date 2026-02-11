@@ -1,17 +1,11 @@
-"""
-NSGA-III
-"""
-
 import pandas as pd
 import numpy as np
-from platypus import NSGAIII, Problem, Real, nondominated, Solution, SBX, PM
+from platypus import NSGAIII, Problem, Real, nondominated, Solution, SBX, PM, GAOperator
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import warnings
-import copy
 
 warnings.filterwarnings("ignore")
-
 
 class AdaptiveOperators:
     def __init__(self, population_size):
@@ -19,11 +13,10 @@ class AdaptiveOperators:
         self.pc_max = 1.0
         self.pc_min = 0.7
         self.pm_max = 0.3
-        self.pm_min = 0.1
-
-        self.di_c_max = 20
+        self.pm_min = 0.05
+        self.di_c_max = 30
         self.di_c_min = 2
-        self.di_m_max = 15
+        self.di_m_max = 20
         self.di_m_min = 2
 
         self.current_pc = self.pc_max
@@ -34,251 +27,224 @@ class AdaptiveOperators:
         self.sbx = SBX(probability=self.current_pc, distribution_index=self.current_di_c)
         self.pm = PM(probability=self.current_pm, distribution_index=self.current_di_m)
 
-    def update_parameters(self, population, generation, update_freq=5, diversity_threshold=15):
-        if generation % update_freq != 0:
-            return
+    def get_variator(self):
+        return GAOperator(self.sbx, self.pm)
 
-        if not population:
+    def update_parameters(self, population, generation, update_freq=5):
+        if generation % update_freq != 0 or not population:
             return
 
         valid_solutions = [sol for sol in population if sol.objectives is not None]
         if len(valid_solutions) < 2:
             return
 
-        objectives = np.array([[-obj for obj in sol.objectives] for sol in valid_solutions])
-        diversity = np.mean(np.std(objectives, axis=0))
+        objectives = np.array([sol.objectives for sol in valid_solutions])
+        
+        obj_min = np.min(objectives, axis=0)
+        obj_max = np.max(objectives, axis=0)
+        denom = obj_max - obj_min
+        denom[denom == 0] = 1.0
+        normalized_objs = (objectives - obj_min) / denom
+        
+        diversity = np.mean(np.std(normalized_objs, axis=0))
 
+        diversity_threshold = 0.1
         if diversity < diversity_threshold:
-            self.current_pc = min(self.pc_max, self.current_pc * 1.2)
-            self.current_pm = min(self.pm_max, self.current_pm * 1.3)
-            self.current_di_c = max(self.di_c_min, self.current_di_c * 0.7)
-            self.current_di_m = max(self.di_m_min, self.current_di_m * 0.7)
+            self.current_pc = min(self.pc_max, self.current_pc * 1.1)
+            self.current_pm = min(self.pm_max, self.current_pm * 1.2)
+            self.current_di_c = max(self.di_c_min, self.current_di_c * 0.9)
+            self.current_di_m = max(self.di_m_min, self.current_di_m * 0.9)
         else:
             self.current_pc = max(self.pc_min, self.current_pc * 0.95)
             self.current_pm = max(self.pm_min, self.current_pm * 0.95)
-            self.current_di_c = min(self.di_c_max, self.current_di_c * 1.05)
-            self.current_di_m = min(self.di_m_max, self.current_di_m * 1.05)
+            self.current_di_c = min(self.di_c_max, self.current_di_c * 1.1)
+            self.current_di_m = min(self.di_m_max, self.current_di_m * 1.1)
 
         self.sbx = SBX(probability=self.current_pc, distribution_index=self.current_di_c)
         self.pm = PM(probability=self.current_pm, distribution_index=self.current_di_m)
-
-        print(f"\n[Generation {generation}] Population Diversity: {diversity:.2f}")
-        print(f"  Crossover Probability: {self.current_pc:.3f} | Mutation Probability: {self.current_pm:.3f}")
-        print(
-            f"  Crossover Distribution Index: {self.current_di_c:.3f} | Mutation Distribution Index: {self.current_di_m:.3f}")
-
 
 def load_data(demand_path, effect_path):
     try:
         demand_df = pd.read_excel(demand_path)
         effect_df = pd.read_excel(effect_path)
-
         demands = demand_df.iloc[:, 1:5].values
         effects = effect_df.iloc[:, 1:5].values
-
         return demand_df, effect_df, demands, effects
-
     except Exception as e:
         print(f"Data loading error: {str(e)}")
         raise
 
-
-def discretize_variables(variables, step=0.001):
-    return np.round(np.array(variables) / step) * step
-
-
-def evaluate_solution(variables, demands, effects, num_plots, num_trees, tolerance=0.005):
+def evaluate_solution(solution_vars, demands, effects, num_plots, num_trees):
     try:
-        if hasattr(variables, 'variables'):
-            variables = variables.variables
-        variables = np.array([v.value if hasattr(v, 'value') else v for v in variables])
+        continuous_vars = np.array(solution_vars)
+        discrete_vars = np.round(continuous_vars / 0.001) * 0.001
+        
+        proportions = discrete_vars.reshape((num_plots, num_trees))
 
-        variables = discretize_variables(variables, step=0.001)
-        proportions = variables.reshape((num_plots, num_trees))
-
-        for i in range(num_plots):
-            row_vars = proportions[i]
-            row_vars = np.clip(row_vars, 0, 1)
-            total_sum = np.sum(row_vars)
-
-            if total_sum > tolerance and total_sum != 1.0:
-                row_vars = row_vars / total_sum
-
-            row_vars = np.clip(row_vars, 0, 1)
-            row_vars = discretize_variables(row_vars, step=0.001)
-            proportions[i] = row_vars
-
+        row_sums = np.sum(proportions, axis=1)
+        tolerance = 0.001
+        constraints = np.maximum(0, np.abs(row_sums - 1.0) - tolerance)
+        
+        safe_sums = row_sums.reshape(-1, 1)
+        safe_sums[safe_sums == 0] = 1.0 
+        normalized_props = proportions / safe_sums
+        
         objectives = []
-        for j in range(4):
-            match_values = proportions * effects[:, j] * demands[:, j].reshape(-1, 1)
+        for j in range(4): 
+            match_values = normalized_props * effects[:, j] * demands[:, j].reshape(-1, 1)
             total_match = np.sum(match_values)
             objectives.append(-total_match)
 
-        constraints = []
-        for i in range(num_plots):
-            sum_constraint = max(0, abs(np.sum(proportions[i]) - 1.0) - tolerance)
-            constraints.append(sum_constraint)
-
-        return objectives, constraints
+        return objectives, constraints.tolist()
 
     except Exception as e:
-        print(f"Objective function calculation error: {str(e)}")
-        raise
-
+        return [1e9]*4, [1e9]*num_plots
 
 def create_optimization_problem(demands, effects):
     num_plots = demands.shape[0]
     num_trees = effects.shape[0]
     num_variables = num_plots * num_trees
-    tolerance = 0.005
-
-    print(f"Number of decision variables: {num_variables}")
-
+    
     def evaluate(solution):
-        return evaluate_solution(solution, demands, effects, num_plots, num_trees, tolerance)
+        objs, constrs = evaluate_solution(solution.variables, demands, effects, num_plots, num_trees)
+        solution.objectives[:] = objs
+        solution.constraints[:] = constrs
 
     problem = Problem(num_variables, 4, num_plots)
     problem.types[:] = Real(0, 1)
+    problem.constraints[:] = "<=0"
     problem.function = evaluate
 
     return problem
 
+def perform_topsis(pareto_objectives):
+    benefit_matrix = -np.array(pareto_objectives)
+    
+    row_sq_sum = np.sqrt(np.sum(benefit_matrix**2, axis=0))
+    row_sq_sum[row_sq_sum == 0] = 1.0
+    normalized_matrix = benefit_matrix / row_sq_sum
+    
+    weights = np.array([0.25, 0.25, 0.25, 0.25])
+    weighted_normalized = normalized_matrix * weights
+    
+    ideal_best = np.max(weighted_normalized, axis=0)
+    ideal_worst = np.min(weighted_normalized, axis=0)
+    
+    dist_best = np.sqrt(np.sum((weighted_normalized - ideal_best)**2, axis=1))
+    dist_worst = np.sqrt(np.sum((weighted_normalized - ideal_worst)**2, axis=1))
+    
+    total_dist = dist_best + dist_worst
+    total_dist[total_dist == 0] = 1.0
+    scores = dist_worst / total_dist
+    
+    best_index = np.argmax(scores)
+    return best_index, scores
 
-def create_initial_population(problem, population_size, num_plots, num_trees):
-    population = []
-
-    for _ in range(population_size):
-        solution = Solution(problem)
-        variables = np.random.random(num_plots * num_trees)
-
-        for i in range(0, len(variables), num_trees):
-            block_vars = variables[i:i + num_trees]
-            block_sum = np.sum(block_vars)
-            if block_sum > 0:
-                block_vars = block_vars / block_sum
-            block_vars = discretize_variables(block_vars, step=0.001)
-            variables[i:i + num_trees] = block_vars
-
-        solution.variables = variables
-        population.append(solution)
-
-    return population
-
-
-def evaluate_population(problem, population):
-    for sol in population:
-        if sol.objectives is None:
-            problem.evaluate(sol)
-
-
-def visualize_pareto_front(pareto_df, n_solutions, output_base_path):
+def visualize_results(pareto_df, best_idx, output_base_path):
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
-    scatter = ax.scatter(
-        pareto_df['PM'],
-        pareto_df['CS'],
-        pareto_df['Runoff'],
-        c=pareto_df['LST'],
-        cmap='viridis'
+    
+    p = ax.scatter(
+        pareto_df['PM'], 
+        pareto_df['CS'], 
+        pareto_df['Runoff'], 
+        c=pareto_df['LST'], 
+        cmap='viridis', 
+        alpha=0.6,
+        s=30
     )
-    plt.colorbar(scatter, label='Fourth Objective (LST)')
+    
+    ax.scatter(
+        pareto_df.iloc[best_idx]['PM'],
+        pareto_df.iloc[best_idx]['CS'],
+        pareto_df.iloc[best_idx]['Runoff'],
+        color='red', s=150, marker='*', label='TOPSIS Best'
+    )
+
+    plt.colorbar(p, label='LST Reduction')
     ax.set_xlabel('PM')
     ax.set_ylabel('CS')
     ax.set_zlabel('Runoff')
-    plt.title(f'Pareto Front (Adaptive NSGA-III, {n_solutions} solutions)')
+    plt.legend()
+    plt.title('Pareto Front (Standard NSGA-III) & TOPSIS')
 
-    output_plot_path = output_base_path.rsplit('.', 1)[0] + '_pareto_front.png'
-    plt.savefig(output_plot_path)
+    output_plot_path = output_base_path.rsplit('.', 1)[0] + '_standard_topsis.png'
+    plt.savefig(output_plot_path, dpi=300)
     plt.close()
-    print(f"Pareto front visualization saved to {output_plot_path}")
-
+    print(f"Visualization saved to {output_plot_path}")
 
 def main(demand_path, effect_path, output_path):
     print("Loading data...")
     demand_df, effect_df, demands, effects = load_data(demand_path, effect_path)
-
-    print("Creating optimization problem...")
+    
+    print("Initializing Standard NSGA-III problem...")
     problem = create_optimization_problem(demands, effects)
 
-    population_size = 400
-    n_iterations = 130
-
+    population_size = 400 
+    n_iterations = 500    
+    divisions_outer = 12  
+    
     adaptive_ops = AdaptiveOperators(population_size)
-
-    print("Starting NSGA-III optimization...")
+    
     algorithm = NSGAIII(problem,
-                        divisions_outer=12,
+                        divisions_outer=divisions_outer,
                         population_size=population_size,
-                        variator=adaptive_ops.sbx,
-                        mutator=adaptive_ops.pm)
+                        variator=adaptive_ops.get_variator())
 
-    num_plots = demands.shape[0]
-    num_trees = effects.shape[0]
+    print("Running optimization (Standard Mode)...")
+    for i in range(n_iterations):
+        algorithm.step()
+        adaptive_ops.update_parameters(algorithm.population, i)
+        algorithm.variator = adaptive_ops.get_variator()
+        
+        if (i + 1) % 50 == 0:
+            print(f"Generation {i + 1}/{n_iterations} completed.")
 
-    initial_population = create_initial_population(
-        problem, population_size, num_plots, num_trees
-    )
-    algorithm.population = initial_population
-
-    evaluate_population(problem, algorithm.population)
-
-    try:
-        for i in range(n_iterations):
-            if i % 5 == 0:
-                print(f"\nIteration {i + 1}/{n_iterations}")
-
-            algorithm.step()
-            evaluate_population(problem, algorithm.population)
-            adaptive_ops.update_parameters(algorithm.population, i, update_freq=5)
-            algorithm.variator = adaptive_ops.sbx
-            algorithm.mutator = adaptive_ops.pm
-
-            if i % 5 == 0:
-                current_solutions = nondominated(algorithm.result)
-                print(f"Current non-dominated solutions: {len(current_solutions)}")
-                if len(current_solutions) > 0:
-                    best_objectives = [-obj for obj in current_solutions[0].objectives]
-                    print(f"Current best objective values: {best_objectives}")
-
-    except Exception as e:
-        print(f"Optimization error: {str(e)}")
-        raise
-
+    print("Optimization finished.")
     final_solutions = nondominated(algorithm.result)
-    n_solutions = len(final_solutions)
+    
+    feasible_solutions = [s for s in final_solutions if s.constraint_violation <= 0.001]
+    
+    if not feasible_solutions:
+        print("Warning: Using best available solutions (Standard constraints).")
+        feasible_solutions = final_solutions
+    
+    print(f"Found {len(feasible_solutions)} solutions.")
 
-    pareto_df = pd.DataFrame([
-        [-obj for obj in sol.objectives] for sol in final_solutions
-    ], columns=['PM', 'CS', 'Runoff', 'LST'])
+    pareto_data = [[-obj for obj in sol.objectives] for sol in feasible_solutions]
+    pareto_df = pd.DataFrame(pareto_data, columns=['PM', 'CS', 'Runoff', 'LST'])
 
-    all_solutions_proportions = []
-    for sol in final_solutions:
-        arr = np.array(sol.variables).reshape((num_plots, num_trees))
-        all_solutions_proportions.append(arr)
+    best_idx, scores = perform_topsis(pareto_data)
+    pareto_df['TOPSIS_Score'] = scores
+    
+    print(f"Best Solution Index: {best_idx}, Score: {scores[best_idx]:.4f}")
 
     with pd.ExcelWriter(output_path) as writer:
-        pareto_df.to_excel(writer, sheet_name='Objectives', index=True)
-        for idx, proportions in enumerate(all_solutions_proportions):
-            df = pd.DataFrame(
-                proportions,
-                columns=effect_df['species'],
-                index=demand_df['FID']
-            )
-            df.to_excel(writer, sheet_name=f'Solution_{idx + 1}')
+        pareto_df.to_excel(writer, sheet_name='Pareto_Objectives')
+        
+        raw_vars = np.array(feasible_solutions[best_idx].variables)
+        
+        final_discrete_vars = np.round(raw_vars / 0.001) * 0.001
+        
+        best_props = final_discrete_vars.reshape((demands.shape[0], effects.shape[0]))
+        
+        row_sums = np.sum(best_props, axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        best_props = best_props / row_sums
+        
+        df_best = pd.DataFrame(
+            best_props,
+            columns=effect_df['species'] if 'species' in effect_df.columns else None,
+            index=demand_df['FID'] if 'FID' in demand_df.columns else None
+        )
+        df_best.to_excel(writer, sheet_name='TOPSIS_Best_Solution')
 
-    print(f"\n=== Optimization completed, results saved to {output_path} ===")
-
-    if n_solutions >= 2:
-        visualize_pareto_front(pareto_df, n_solutions, output_path)
-    else:
-        print("\nSingle solution objective values:")
-        for col, val in zip(['PM', 'CS', 'Runoff', 'LST'], pareto_df.iloc[0]):
-            print(f"{col}: {val:.4f}")
-
+    visualize_results(pareto_df, best_idx, output_path)
+    print("Done.")
 
 if __name__ == "__main__":
-    DEMAND_PATH = "{DEMAND_FILE_PATH}"
-    EFFECT_PATH = "{EFFECT_FILE_PATH}"
-    OUTPUT_PATH = "{OUTPUT_FILE_PATH}"
-
+    DEMAND_PATH = "demand_data.xlsx"
+    EFFECT_PATH = "effect_data.xlsx"
+    OUTPUT_PATH = "final_result_standard.xlsx"
+    
     main(DEMAND_PATH, EFFECT_PATH, OUTPUT_PATH)
